@@ -3,8 +3,12 @@
 /.cache
 /.idea
 /.coverage
+/.vscode
+/.pytest_cache
 /bit.egg-info
 /build
 /dist
 /docs/build
 /wheelhouse
+/.venv
+/.DS_Store

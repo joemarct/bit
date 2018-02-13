@@ -5,6 +5,7 @@ from bit.crypto import double_sha256, sha256
 from bit.exceptions import InsufficientFunds
 from bit.format import address_to_public_key_hash
 from bit.network.rates import currency_to_satoshi_cached
+from bit.network import get_fee_cached
 from bit.utils import (
     bytes_to_hex, chunk_data, hex_to_bytes, int_to_unknown_bytes
 )
@@ -73,7 +74,7 @@ def estimate_tx_fee(n_in, n_out, satoshis, compressed):
     return estimated_size * satoshis
 
 
-def sanitize_tx_data(unspents, outputs, fee, leftover, combine=True, message=None, compressed=True):
+def sanitize_tx_data(unspents, outputs, fee, leftover, combine=True, message=None, compressed=True, sweep=False):
 
     outputs = outputs.copy()
 
@@ -95,6 +96,13 @@ def sanitize_tx_data(unspents, outputs, fee, leftover, combine=True, message=Non
 
     # Include return address in fee estimate.
     fee = estimate_tx_fee(len(unspents), len(outputs) + len(messages) + 1, fee, compressed)
+    # If this is a sweep transaction, deduct the fee from one of the outputs
+    if sweep:
+        for i, output in enumerate(outputs):
+            if output[1] > fee:
+                payer_output = outputs.pop(i)
+                outputs.append((payer_output[0], payer_output[1] - fee))
+                break
     total_out = sum(out[1] for out in outputs) + fee
 
     total_in = 0
@@ -219,6 +227,97 @@ def create_p2pkh_transaction(private_key, unspents, outputs):
         )
 
         signature = private_key.sign(hashed) + b'\x01'
+
+        script_sig = (
+            len(signature).to_bytes(1, byteorder='little') +
+            signature +
+            public_key_len +
+            public_key
+        )
+
+        txin.script = script_sig
+        txin.script_len = int_to_unknown_bytes(len(script_sig), byteorder='little')
+
+    return bytes_to_hex(
+        version +
+        input_count +
+        construct_input_block(inputs) +
+        output_count +
+        output_block +
+        lock_time
+    )
+
+
+def create_sweep_transaction(private_keys, destination_address, amount=None, currency='satoshi', fee=None, leftover=None, 
+                             message=None, compressed=True):
+
+    private_key_map = {}
+    unspents = []
+    for key in private_keys:
+        utxos = key.get_unspents()
+        unspents += utxos
+        for utx in utxos:
+            private_key_map[utx.txid] = key
+
+    version = VERSION_1
+    lock_time = LOCK_TIME
+    sequence = SEQUENCE
+    hash_type = HASH_TYPE
+    input_count = int_to_unknown_bytes(len(unspents), byteorder='little')
+
+    # Construct the outputs, taking the fee into account 
+    sum_of_unspents = sum([int(x.amount) for x in unspents])
+    amount = amount or sum_of_unspents
+    outputs = [(destination_address, sum_of_unspents, currency)]
+
+    unspents, outputs = sanitize_tx_data(
+        unspents,
+        outputs,
+        fee or get_fee_cached(),
+        leftover or private_keys[0].address,
+        combine=True,
+        message=message,
+        compressed=compressed,
+        sweep=True
+    )
+
+    output_count = int_to_unknown_bytes(len(outputs), byteorder='little')
+    output_block = construct_output_block(outputs)
+
+    # Optimize for speed, not memory, by pre-computing values.
+    inputs = []
+    for unspent in unspents:
+        script = hex_to_bytes(unspent.script)
+        script_len = int_to_unknown_bytes(len(script), byteorder='little')
+        txid = hex_to_bytes(unspent.txid)[::-1]
+        txindex = unspent.txindex.to_bytes(4, byteorder='little')
+
+        inputs.append(TxIn(script, script_len, txid, txindex))
+
+    for i, txin in enumerate(inputs):
+
+        hashed = sha256(
+            version +
+            input_count +
+            b''.join(ti.txid + ti.txindex + OP_0 + sequence
+                     for ti in islice(inputs, i)) +
+            txin.txid +
+            txin.txindex +
+            txin.script_len +
+            txin.script +
+            sequence +
+            b''.join(ti.txid + ti.txindex + OP_0 + sequence
+                     for ti in islice(inputs, i + 1, None)) +
+            output_count +
+            output_block +
+            lock_time +
+            hash_type
+        )
+
+        private_key = private_key_map[unspents[i].txid]
+        signature = private_key.sign(hashed) + b'\x01'
+        public_key = private_key.public_key
+        public_key_len = len(public_key).to_bytes(1, byteorder='little')
 
         script_sig = (
             len(signature).to_bytes(1, byteorder='little') +
